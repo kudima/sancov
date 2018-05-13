@@ -1,0 +1,186 @@
+--- sancov.cc.320631	2018-04-09 15:08:04.201550654 +0400
++++ sancov.cc	2018-04-09 15:07:01.224542466 +0400
+@@ -27,6 +27,7 @@
+ #include "llvm/Object/Binary.h"
+ #include "llvm/Object/COFF.h"
+ #include "llvm/Object/MachO.h"
++#include "llvm/Object/ELFObjectFile.h"
+ #include "llvm/Object/ObjectFile.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/CommandLine.h"
+@@ -50,6 +51,7 @@
+ 
+ #include <set>
+ #include <vector>
++#include <elf.h>
+ 
+ using namespace llvm;
+ 
+@@ -723,6 +725,156 @@
+   }
+ }
+ 
++#define ELF64_PLT_HDR_SIZE   0x10
++#define ELF64_PLT_ENTRY_SIZE 0x10
++
++// Collects offsets of all the relocations related to sanitizer
++std::set<uint64_t> ELF64LEGetCoverageGO(const object::ELF64LEObjectFile *O)
++{
++  std::set<uint64_t> Result;
++
++  if (O->getArch() != Triple::x86_64) 
++    return Result;
++
++  for (object::SectionRef Section : O->sections()) {
++
++    StringRef Name;
++    Section.getName(Name);
++
++    for (const object::RelocationRef &RelRef : Section.relocations()) {
++      
++      if (RelRef.getType() != R_X86_64_JUMP_SLOT)
++	continue;
++
++      const object::symbol_iterator SI = RelRef.getSymbol();
++
++      if (SI != O->symbol_end()) {
++
++	typedef typename object::ELF64LEObjectFile::Elf_Rela Elf_Rela;
++
++	Expected<StringRef> NameOrErr = SI->getName();
++	failIfError(NameOrErr);
++	StringRef SymName = NameOrErr.get();
++
++	object::DataRefImpl Rel = RelRef.getRawDataRefImpl();
++
++	if (isCoveragePointSymbol(SymName)) {
++	  const Elf_Rela *ERela = O->getRela(Rel);
++	  Result.insert(ERela->r_offset);
++	}
++      }
++    }
++  }
++
++  return Result;
++}
++
++std::set<uint64_t> ELF64LEGetCoveragePltSlots(const object::ELF64LEObjectFile *O,
++    std::set<uint64_t> &GO)
++{
++  std::set<uint64_t> Result;
++
++  if (O->getArch() != Triple::x86_64) { 
++    return Result;
++  }
++
++  for (object::SectionRef Section : O->sections()) {
++
++    StringRef Name;
++    Section.getName(Name);
++
++    if (Name == ".plt") {
++
++      Triple TheTriple("unknown-unknown-unknown");
++      TheTriple.setArch(Triple::ArchType(O->getArch()));
++      auto TripleName = TheTriple.getTriple();
++
++      std::string Error;
++      const Target *TheTarget = TargetRegistry::lookupTarget(TripleName, Error);
++      failIfNotEmpty(Error);
++
++      std::unique_ptr<const MCSubtargetInfo> STI(
++	  TheTarget->createMCSubtargetInfo(TripleName, "", ""));
++      failIfEmpty(STI, "no subtarget info for target " + TripleName);
++
++      std::unique_ptr<const MCRegisterInfo> MRI(
++	  TheTarget->createMCRegInfo(TripleName));
++      failIfEmpty(MRI, "no register info for target " + TripleName);
++
++      std::unique_ptr<const MCAsmInfo> AsmInfo(
++	  TheTarget->createMCAsmInfo(*MRI, TripleName));
++      failIfEmpty(AsmInfo, "no asm info for target " + TripleName);
++
++      std::unique_ptr<const MCObjectFileInfo> MOFI(new MCObjectFileInfo);
++      MCContext Ctx(AsmInfo.get(), MRI.get(), MOFI.get());
++      std::unique_ptr<MCDisassembler> DisAsm(
++	  TheTarget->createMCDisassembler(*STI, Ctx));
++      failIfEmpty(DisAsm, "no disassembler info for target " + TripleName);
++
++      std::unique_ptr<const MCInstrInfo> MII(TheTarget->createMCInstrInfo());
++      failIfEmpty(MII, "no instruction info for target " + TripleName);
++
++      std::unique_ptr<const MCInstrAnalysis> MIA(
++	  TheTarget->createMCInstrAnalysis(MII.get()));
++      failIfEmpty(MIA, "no instruction analysis info for target " + TripleName);
++
++      StringRef BytesStr;
++      failIfError(Section.getContents(BytesStr));
++      ArrayRef<uint8_t> Bytes(reinterpret_cast<const uint8_t *>(BytesStr.data()),
++                            BytesStr.size());
++
++      uint64_t SectionAddr = Section.getAddress();
++
++      // Entries are jmp [address] instructions, (seems to be the case for both
++      // gcc and llvm), we check if the entry is actually a branch
++      // and extract the value of the target address
++      for (uint64_t Index = ELF64_PLT_HDR_SIZE, Size = 0; Index < Section.getSize();
++	  Index += ELF64_PLT_ENTRY_SIZE) {
++
++	MCInst Inst;
++
++	if (!DisAsm->getInstruction(Inst, Size, Bytes.slice(Index),
++				    SectionAddr + Index, nulls(), nulls())) {
++	  continue;
++	}
++
++	if (!MIA->isIndirectBranch(Inst))
++	  continue;
++
++	if (Inst.getNumOperands() != 5)
++	  continue;
++
++	const MCOperand &operand = Inst.getOperand(3);
++
++	if (!operand.isImm()) 
++	  continue;
++
++	uint64_t Target = operand.getImm() + SectionAddr + Index + Size;
++	if (GO.find(Target) != GO.end()) {
++	  Result.insert(SectionAddr + Index);
++	}
++      }
++    }
++  }
++
++  return Result;
++}
++
++static void findELF64LEIndirectCovFunctions(const object::ELF64LEObjectFile *O,
++    std::set<uint64_t> &Result) {
++
++  if (O->getArch() != Triple::x86_64) 
++    return;
++
++  // Collect GOT entries for __sanitizer_cov* functions
++  std::set<uint64_t> GO = ELF64LEGetCoverageGO(O);
++  // Map GOT entries to PLT redirects 
++  std::set<uint64_t> Slots = ELF64LEGetCoveragePltSlots(O, GO);
++
++  Result.insert(Slots.begin(), Slots.end());
++}
++
++
+ // Locate __sanitizer_cov* function addresses that are used for coverage
+ // reporting.
+ static std::set<uint64_t>
+@@ -764,6 +916,10 @@
+     findMachOIndirectCovFunctions(*MO, &Result);
+   }
+ 
++  if (const auto *ELF64 = dyn_cast<object::ELF64LEObjectFile>(&O)) {
++    findELF64LEIndirectCovFunctions(ELF64, Result);
++  }
++
+   return Result;
+ }
+ 
